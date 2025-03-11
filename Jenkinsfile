@@ -3,11 +3,12 @@ pipeline {
 
     environment {
         REGISTRY = 'user12.azurecr.io'
-        IMAGE_NAME = 'product'
+        IMAGE_NAME = 'delivery'
         AKS_CLUSTER = 'user12-aks'
         RESOURCE_GROUP = 'user12-rsrcgrp'
         AKS_NAMESPACE = 'default'
         AZURE_CREDENTIALS_ID = 'Azure-Cred'
+        GIT_CREDENTIALS_ID = 'Git-Cred'
         TENANT_ID = 'f46af6a3-e73f-4ab2-a1f7-f33919eda5ac' // Service Principal 등록 후 생성된 ID
     }
  
@@ -17,7 +18,29 @@ pipeline {
                 checkout scm
             }
         }
-        
+
+        stage('Check Changes') {
+            steps {
+                script {
+                    def changes = sh(script: "git diff --name-only HEAD~1", returnStdout: true).trim()
+                    def ignoredFiles = ['./kubernetes/deploy.yaml', './kubernetes/service.yaml']
+                    
+                    def shouldRun = true
+                    changes.split('\n').each { file ->
+                        if (ignoredFiles.any { file.matches(it) }) {
+                            shouldRun = false
+                        }
+                    }
+                    
+                    if (!shouldRun) {
+                        echo "k8s yaml files were changed. Skipping pipeline."
+                        currentBuild.result = 'SUCCESS'
+                        return
+                    }
+                }
+            }
+        }
+
         stage('Maven Build') {
             steps {
                 withMaven(maven: 'Maven') {
@@ -61,17 +84,30 @@ pipeline {
             }
         }
         
-        stage('Deploy to AKS') {
+        stage('Update deploy.yaml / service.yaml') {
             steps {
                 script {
                     sh "az aks get-credentials --resource-group ${RESOURCE_GROUP} --name ${AKS_CLUSTER}"
                     sh """
-                    sed 's/latest/v${env.BUILD_ID}/g' kubernetes/deploy.yaml > output.yaml
-                    cat output.yaml
-                    kubectl apply -f output.yaml
-                    kubectl apply -f kubernetes/service.yaml
-                    rm output.yaml
+                    sed 's/IMAGE_TAG/v${env.BUILD_ID}/g' template/deploy.yaml > kubernetes/deploy.yaml
+                    cat template/service.yaml > kubernetes/service.yaml
                     """
+                }
+            }
+        }
+
+        stage('Push .yaml to Repo') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: env.GIT_CREDENTIALS_ID, usernameVariable: 'GIT_USER', passwordVariable: 'GIT_SECRET')]) {
+                        sh '''
+                        git config --global user.email ''
+                        git config --global user.name 'Jenkins'
+                        git add kubernetes/deploy.yaml kubernetes/service.yaml
+                        git commit -m "Update deploy.yaml / service.yaml"
+                        git push https://${GIT_SECRET}@github.com/tekkenlog/reqres_delivery.git master
+                        '''
+                    }
                 }
             }
         }
